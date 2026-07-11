@@ -10,12 +10,16 @@
 # constant columns.
 #
 # usage: runRayforce.sh --db-dir DIR --param-dir DIR --date DATE --cores N \
-#                       --queryfile FILE --result FILE [--idx FILTER]
+#                       --layout grouped|parted --queryfile FILE --result FILE \
+#                       [--thread-label N] [--idx FILTER] [--query-output-dir DIR]
 set -euo pipefail
 
 RAYFORCE_BIN="${RAYFORCE_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/rayforce/rayforce}"
 SELFDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IDXFILTER=""
+LAYOUT="grouped"
+QUERY_OUTPUT_DIR=""
+THREAD_LABEL=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -23,17 +27,29 @@ while [[ $# -gt 0 ]]; do
         --param-dir)  PARAM_DIR="$2"; shift 2 ;;
         --date)       DATE="$2"; shift 2 ;;
         --cores)      CORES="$2"; shift 2 ;;
+        --thread-label) THREAD_LABEL="$2"; shift 2 ;;
+        --layout)     LAYOUT="$2"; shift 2 ;;
         --queryfile)  QUERYFILE="$2"; shift 2 ;;
         --result)     RESULT="$2"; shift 2 ;;
         --idx)        IDXFILTER="$2"; shift 2 ;;
+        --query-output-dir) QUERY_OUTPUT_DIR="$2"; shift 2 ;;
         *) echo "runRayforce.sh: unknown option $1" >&2; exit 1 ;;
     esac
 done
 
+THREAD_LABEL="${THREAD_LABEL:-${CORES}}"
+
 [[ -x "${RAYFORCE_BIN}" ]] || { echo "rayforce binary not found: ${RAYFORCE_BIN}" >&2; exit 1; }
+[[ "${LAYOUT}" == "grouped" || "${LAYOUT}" == "parted" ]] || {
+    echo "runRayforce.sh: --layout must be grouped or parted" >&2; exit 1;
+}
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
+
+if [[ -n "${QUERY_OUTPUT_DIR}" ]]; then
+    mkdir -p "${QUERY_OUTPUT_DIR}"
+fi
 
 # ---- parameter prelude (static exchange map + generated per-size params) ----
 cat "${SELFDIR}/prelude.rfl" > "${WORK}/params.rfl"
@@ -57,6 +73,8 @@ RAY_DBDIR="${DB_DIR}/rayforce" \
 RAY_PARAMS="${WORK}/params.rfl" \
 RAY_DRIVER="${WORK}/driver.rfl" \
 RAY_RESULT="${WORK}/machine.csv" \
+RAY_LAYOUT="${LAYOUT}" \
+RAY_QUERY_OUTPUT_DIR="${QUERY_OUTPUT_DIR}" \
     "${RAYFORCE_BIN}" -c "${CORES}" "${SELFDIR}/runQueries.rfl" >&2
 
 printf '(do (println (.sys.build)) (exit 0))\n' > "${WORK}/ver.rfl"
@@ -67,7 +85,7 @@ EVERSION="$("${RAYFORCE_BIN}" -c 1 "${WORK}/ver.rfl" 2>/dev/null | head -n1 | tr
 # machine.csv:   idx,status,run1timeNS,run2timeNS,run3timeNS,run3memKB,ressizeKB
 # QUERYFILE:     idx|tags|query|parameter   (pipe; Rayfall has no '|')
 mkdir -p "$(dirname "${RESULT}")"
-awk -v ver="${EVERSION}" -v cores="${CORES}" '
+awk -v ver="${EVERSION}" -v cores="${THREAD_LABEL}" -v layout="${LAYOUT}" '
   BEGIN { FS="|"; OFS="|" }
   # query text + tags keyed by idx, from the pipe-delimited query file
   FNR==NR {
@@ -88,13 +106,13 @@ awk -v ver="${EVERSION}" -v cores="${CORES}" '
     tags=(idx in qtags)?qtags[idx]:"load";
     if (idx in qtext)      { q=qtext[idx] }
     else if (idx==0)       { q="load splayed DB (mmap)"; tags="load" }
-    else if (idx==-2)      { q="sort by sym,time (materialize into RAM)"; tags="load" }
-    else if (idx==-3)      { q="add grouped index on sym"; tags="load" }
+    else if (idx==-2)      { q=(layout=="parted" ? "sort by sym,time (materialize into RAM)" : "sort by time (materialize into RAM)"); tags="load" }
+    else if (idx==-3)      { q=(layout=="parted" ? "add parted index on sym" : "add grouped index on sym"); tags="load" }
     else                   { q="setup" }
     print "memory","0_0_0",cores,"Rayforce","rayforce","rayforce", \
-          "sym,time","sym",ver,idx,tags,q,status, \
+          (layout=="parted" ? "sym,time" : "time"),"sym",ver,idx,tags,q,status, \
           r1,r2,r3,mem,0,0,0,rsz
   }
 ' "${QUERYFILE}" "${WORK}/machine.csv" > "${RESULT}"
 
-echo "Rayforce results -> ${RESULT}" >&2
+echo "Rayforce ${LAYOUT} results -> ${RESULT}" >&2
